@@ -25,16 +25,10 @@ mameo の機能拡張、設定・辞書管理、タスクトレイ常駐、お�
 
 ### タスクリスト
 - [ ] Workspace 化: `crates/core`（本体 daemon）+ `crates/gui`（Iced アプリ）構成に整理
-- [ ] Iced による GUI 雛形作成（水色クールテーマ・ウィンドウ表示まで）
-- [ ] 設定画面の実装
-  - トリガーキー選択（RightAlt / RightControl / RightShift ドロップダウン）
-  - 言語指定（`ja` / `auto` 等）
-  - API キー入力（パスワード形式）
-  - クリップボード復元 On/Off
-  - 既定貼り付けモード（`auto` / `copy_only` / `ctrl_y`）
-  - アプリ別ルール（`app_rules`）の一覧表示・編集
-- [ ] GUI 側での `config.toml` 保存処理（既存 `Config` 構造と serde で整合させる）
-- [ ] core 側（トレイメニュー処理）に GUI 検出 conditional を実装（上記起動フロー）
+- [x] mameo-config (別リポジトリ) に Iced GUI 実装: 水色ダークテーマ、トリガーキー / 言語 / API キー / クリップボード復元 / 貼り付けモード / アプリ別ルール編集、config.toml 保存（実機検証済み）
+- [x] config 配置ルール統一: exe 隣接に config.toml があればポータブル、無ければ `%APPDATA%\mameo` (Roaming)。core と GUI で同一ロジック（MSIX/Store 対応）
+- [x] core 側（トレイメニュー処理）に GUI 検出 conditional を実装（上記起動フロー）
+- [ ] GUI 側での `config.toml` 保存処理（既存 `Config` 構造と serde で整合させる） ※実装済み・残: 構造体二重定義の共通化検討
 - [ ] GUI 保存後に core へ設定変更を反映（Reload 不要の即時反映、まずは保存→トレイ側再読み込みで暫定対応でも可）
 
 ### CLI から GUI を開けるようにする（併設）
