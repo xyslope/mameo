@@ -1,0 +1,5 @@
+/target
+# 実行時に exe と同ディレリに生成されるローカルファイル（開発時の踏み込み防止）
+config.toml
+DICT.csv
+update.ps1
