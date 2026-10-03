@@ -28,8 +28,8 @@ use windows::Win32::System::Threading::{
 };
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-    TranslateMessage, MSG,
+    DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, TranslateMessage,
+    MSG,
 };
 
 const GROQ_API_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
@@ -68,10 +68,24 @@ impl Default for Config {
 }
 
 fn get_base_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."))
+    // 1) exe と同じディレクトリに config.toml がある → ポータブルモード
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let dir = dir.to_path_buf();
+            if dir.join("config.toml").exists() {
+                return dir;
+            }
+        }
+    }
+    // 2) %APPDATA%\mameo (Roaming)。Microsoft 標準のユーザー単位設定場所。
+    //    (Store/MSIX 版は exe 隣接に書き込めないため、インストール版はこちら)
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let dir = PathBuf::from(appdata).join("mameo");
+        if fs::create_dir_all(&dir).is_ok() {
+            return dir;
+        }
+    }
+    PathBuf::from(".")
 }
 
 fn load_or_create_config(base_dir: &Path) -> Config {
@@ -93,7 +107,7 @@ fn load_or_create_config(base_dir: &Path) -> Config {
 fn load_dictionary(base_dir: &Path) -> HashMap<String, String> {
     let mut dict = HashMap::new();
     let path = base_dir.join("DICT.csv"); // 拡張子も .csv にしちゃうと自然です
-    
+
     if !path.exists() {
         let template = "スリデブ,Slidev\nクオート,Quarto\nイーマックス,emacs\nエルパカ,Elpaca\n";
         let _ = fs::write(&path, template);
@@ -106,7 +120,7 @@ fn load_dictionary(base_dir: &Path) -> HashMap<String, String> {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            
+
             // カンマで2つに分割
             let parts: Vec<&str> = line.splitn(2, ',').map(|s| s.trim()).collect();
             if parts.len() == 2 && !parts[0].is_empty() {
@@ -190,7 +204,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     unsafe {
         use windows::Win32::Foundation::GetLastError;
-        let mutex_name: Vec<u16> = "Global\\mameo_single_instance_mutex\0".encode_utf16().collect();
+        let mutex_name: Vec<u16> = "Global\\mameo_single_instance_mutex\0"
+            .encode_utf16()
+            .collect();
         let _ = CreateMutexW(None, true, PCWSTR(mutex_name.as_ptr()));
         if GetLastError().0 == 183 {
             // ERROR_ALREADY_EXISTS
@@ -204,8 +220,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- タスクトレイメニューの構築 ---
     let tray_menu = Menu::new();
-    let item_open_config = MenuItem::new("設定を開く (config.toml)", true, None);
-    let item_open_dict = MenuItem::new("辞書を開く (DICT.md)", true, None);
+    let item_open_config = MenuItem::new("設定を開く", true, None);
+    let item_open_dict = MenuItem::new("辞書を開く (DICT.csv)", true, None);
     let item_reload = MenuItem::new("設定・辞書の再読み込み", true, None);
     let item_exit = MenuItem::new("終了 (Exit)", true, None);
 
@@ -224,7 +240,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- 音声入力ストリーム初期化 ---
     let host = cpal::default_host();
     let device = host.default_input_device().expect("No input device found");
-    let audio_cfg = device.default_input_config().expect("Failed to get audio config");
+    let audio_cfg = device
+        .default_input_config()
+        .expect("Failed to get audio config");
     let sample_rate = audio_cfg.sample_rate().0;
     let channels = audio_cfg.channels();
 
@@ -245,7 +263,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
-        |err| eprintln!("Audio stream error: {}", err),
+        |err| eprintln!("Audio stream error: {err}"),
         None,
     )?;
     stream.play()?;
@@ -279,48 +297,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     audio_buf_key.lock().unwrap().clear();
                     is_rec_key.store(true, Ordering::SeqCst);
                 }
-            } else if event.event_type == EventType::KeyRelease(target_key) {
-                if is_rec_key.load(Ordering::SeqCst) {
-                    is_rec_key.store(false, Ordering::SeqCst);
+            } else if event.event_type == EventType::KeyRelease(target_key)
+                && is_rec_key.load(Ordering::SeqCst)
+            {
+                is_rec_key.store(false, Ordering::SeqCst);
 
-                    let samples = audio_buf_key.lock().unwrap().clone();
-                    if samples.len() < (sample_rate as usize / 5) {
-                        return; // 0.2秒未満はスキップ
-                    }
+                let samples = audio_buf_key.lock().unwrap().clone();
+                if samples.len() < (sample_rate as usize / 5) {
+                    return; // 0.2秒未満はスキップ
+                }
 
-                    let config_clone = Arc::clone(&config_key);
-                    let dict_clone = Arc::clone(&dict_key);
+                let config_clone = Arc::clone(&config_key);
+                let dict_clone = Arc::clone(&dict_key);
 
-                    thread::spawn(move || {
-                        if let Ok(wav_bytes) = samples_to_wav(samples, sample_rate) {
-                            let (prompt, local_dict) = {
-                                let d = dict_clone.read().unwrap();
-                                let p = d.values().cloned().collect::<Vec<_>>().join(", ");
-                                (p, d.clone())
-                            };
+                thread::spawn(move || {
+                    if let Ok(wav_bytes) = samples_to_wav(samples, sample_rate) {
+                        let (prompt, local_dict) = {
+                            let d = dict_clone.read().unwrap();
+                            let p = d.values().cloned().collect::<Vec<_>>().join(", ");
+                            (p, d.clone())
+                        };
 
-                            if let Ok(mut text) = call_groq_whisper(&api_key, wav_bytes, &lang, &prompt) {
-                                let trimmed = text.trim();
-                                if trimmed == "ご視聴ありがとうございました"
-                                    || trimmed == "ありがとうございました"
-                                    || trimmed == "チャンネル登録お願いします"
-                                {
-                                    return;
-                                }
+                        if let Ok(mut text) = call_groq_whisper(&api_key, wav_bytes, &lang, &prompt)
+                        {
+                            let trimmed = text.trim();
+                            if trimmed == "ご視聴ありがとうございました"
+                                || trimmed == "ありがとうございました"
+                                || trimmed == "チャンネル登録お願いします"
+                            {
+                                return;
+                            }
 
-                                for (wrong, correct) in local_dict.iter() {
-                                    text = text.replace(wrong, correct);
-                                }
+                            for (wrong, correct) in local_dict.iter() {
+                                text = text.replace(wrong, correct);
+                            }
 
-                                let clean_text = text.trim();
-                                if !clean_text.is_empty() {
-                                    let cfg = config_clone.read().unwrap();
-                                    dispatch_paste(clean_text, &cfg);
-                                }
+                            let clean_text = text.trim();
+                            if !clean_text.is_empty() {
+                                let cfg = config_clone.read().unwrap();
+                                dispatch_paste(clean_text, &cfg);
                             }
                         }
-                    });
-                }
+                    }
+                });
             }
         });
     });
@@ -337,9 +356,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if let Ok(event) = menu_channel.try_recv() {
                 if event.id == item_open_config.id() {
-                    open_file(&base_dir.join("config.toml"));
+                    // GUI (mameo-config.exe) が core と同じディレクトリにあれば起動、
+                    // 無ければ config.toml を既定エディタで開く（フォールバック）。
+                    let gui_exe = base_dir.join("mameo-config.exe");
+                    if gui_exe.exists() {
+                        let _ = std::process::Command::new(&gui_exe).spawn();
+                    } else {
+                        open_file(&base_dir.join("config.toml"));
+                    }
                 } else if event.id == item_open_dict.id() {
-                    open_file(&base_dir.join("DICT.md"));
+                    open_file(&base_dir.join("DICT.csv"));
                 } else if event.id == item_reload.id() {
                     let mut c = config.write().unwrap();
                     *c = load_or_create_config(&base_dir);
@@ -402,7 +428,10 @@ fn dispatch_paste(text: &str, config: &Config) {
     }
 }
 
-fn samples_to_wav(samples: Vec<f32>, sample_rate: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn samples_to_wav(
+    samples: Vec<f32>,
+    sample_rate: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut cursor = Cursor::new(Vec::new());
     let spec = hound::WavSpec {
         channels: 1,
@@ -444,7 +473,7 @@ fn call_groq_whisper(
 
     let res = client
         .post(GROQ_API_URL)
-        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Authorization", format!("Bearer {api_key}"))
         .multipart(form)
         .send()?
         .json::<Value>()?;
