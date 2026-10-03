@@ -1,6 +1,6 @@
 # Agent Instructions & Constraints (AGENTS.md)
 
-vtype のコード生成・修正を行うすべての AI エージェントは以下の原則を厳守すること。
+mameo のコード生成・修正を行うすべての AI エージェントは以下の原則を厳守すること。
 
 ---
 
