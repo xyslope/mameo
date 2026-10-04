@@ -3,15 +3,13 @@
 use arboard::Clipboard;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+use mameo::{get_base_dir, load_dictionary, Config, GROQ_API_URL};
 use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use rdev::{listen, Event, EventType, Key as RKey};
 use reqwest::blocking::multipart;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::fs;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -32,104 +30,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MSG,
 };
 
-const GROQ_API_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct AppRule {
-    pub process_name: String,
-    pub paste_mode: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Config {
-    pub trigger_key: String,
-    pub language: String,
-    pub groq_api_key: String,
-    pub restore_clipboard: bool,
-    pub default_paste_mode: String,
-    #[serde(default)]
-    pub app_rules: Vec<AppRule>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            trigger_key: "RightAlt".to_string(),
-            language: "ja".to_string(),
-            groq_api_key: "".to_string(),
-            restore_clipboard: true,
-            default_paste_mode: "auto".to_string(),
-            app_rules: vec![AppRule {
-                process_name: "emacs.exe".to_string(),
-                paste_mode: "copy_only".to_string(),
-            }],
-        }
-    }
-}
-
-fn get_base_dir() -> PathBuf {
-    // 1) exe と同じディレクトリに config.toml がある → ポータブルモード
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let dir = dir.to_path_buf();
-            if dir.join("config.toml").exists() {
-                return dir;
-            }
-        }
-    }
-    // 2) %APPDATA%\mameo (Roaming)。Microsoft 標準のユーザー単位設定場所。
-    //    (Store/MSIX 版は exe 隣接に書き込めないため、インストール版はこちら)
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let dir = PathBuf::from(appdata).join("mameo");
-        if fs::create_dir_all(&dir).is_ok() {
-            return dir;
-        }
-    }
-    PathBuf::from(".")
-}
-
 fn load_or_create_config(base_dir: &Path) -> Config {
-    let path = base_dir.join("config.toml");
-    if path.exists() {
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(cfg) = toml::from_str::<Config>(&content) {
-                return cfg;
-            }
-        }
-    }
-    let default_cfg = Config::default();
-    if let Ok(toml_str) = toml::to_string_pretty(&default_cfg) {
-        let _ = fs::write(&path, toml_str);
-    }
-    default_cfg
+    Config::load_or_create(base_dir)
 }
 
-fn load_dictionary(base_dir: &Path) -> HashMap<String, String> {
-    let mut dict = HashMap::new();
-    let path = base_dir.join("DICT.csv"); // 拡張子も .csv にしちゃうと自然です
-
-    if !path.exists() {
-        let template = "スリデブ,Slidev\nクオート,Quarto\nイーマックス,emacs\nエルパカ,Elpaca\n";
-        let _ = fs::write(&path, template);
-    }
-
-    if let Ok(content) = fs::read_to_string(&path) {
-        for line in content.lines() {
-            let line = line.trim();
-            // 空行や # で始まるコメント行はスキップ
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            // カンマで2つに分割
-            let parts: Vec<&str> = line.splitn(2, ',').map(|s| s.trim()).collect();
-            if parts.len() == 2 && !parts[0].is_empty() {
-                dict.insert(parts[0].to_string(), parts[1].to_string());
-            }
-        }
-    }
-    dict
-}
 #[cfg(windows)]
 fn get_active_process_name() -> Option<String> {
     unsafe {
