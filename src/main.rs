@@ -3,7 +3,7 @@
 use arboard::Clipboard;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
-use mameo::{get_base_dir, load_dictionary, Config, GROQ_API_URL};
+use mameo::{get_base_dir, load_dictionary_rows, Config, GROQ_API_URL};
 use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use rdev::{listen, Event, EventType, Key as RKey};
 use reqwest::blocking::multipart;
@@ -103,6 +103,26 @@ fn open_file(path: &Path) {
         .spawn();
 }
 
+/// ファイルの mtime を取得（存在しない場合は None）。
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// GUI (mameo-config.exe) を起動する。tab は設定タブ指定。
+/// exe が無い場合はフォールバック (config.toml / DICT.csv を既定エディタで開く)。
+fn launch_gui_or_editor(base_dir: &Path, tab: Option<&str>, fallback: &Path) {
+    let gui_exe = base_dir.join("mameo-config.exe");
+    if gui_exe.exists() {
+        let mut cmd = std::process::Command::new(&gui_exe);
+        if let Some(t) = tab {
+            cmd.arg(t);
+        }
+        let _ = cmd.spawn();
+    } else {
+        open_file(fallback);
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Windows 多重起動防止ガード
     #[cfg(windows)]
@@ -120,7 +140,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let base_dir = get_base_dir();
     let config = Arc::new(RwLock::new(load_or_create_config(&base_dir)));
-    let dict = Arc::new(RwLock::new(load_dictionary(&base_dir)));
+    let dict = Arc::new(RwLock::new(load_dictionary_rows(&base_dir)));
+
+    // --- ファイル監視ポーラ（config.toml / DICT.csv の外部変更を自動反映） ---
+    // GUI からの保存を Reload 無しで受け取る。mtime 変化検出のみの軽量実装。
+    {
+        let config_watch = Arc::clone(&config);
+        let dict_watch = Arc::clone(&dict);
+        let base = base_dir.clone();
+        thread::spawn(move || {
+            let mut last_cfg_m = file_mtime(&base.join("config.toml"));
+            let mut last_dict_m = file_mtime(&base.join("DICT.csv"));
+            loop {
+                thread::sleep(std::time::Duration::from_millis(1500));
+                let cfg_m = file_mtime(&base.join("config.toml"));
+                let dict_m = file_mtime(&base.join("DICT.csv"));
+                if cfg_m != last_cfg_m {
+                    last_cfg_m = cfg_m;
+                    let c = Config::load_or_default(&base);
+                    if let Ok(mut w) = config_watch.try_write() {
+                        *w = c;
+                    }
+                }
+                if dict_m != last_dict_m {
+                    last_dict_m = dict_m;
+                    let d = load_dictionary_rows(&base);
+                    if let Ok(mut w) = dict_watch.try_write() {
+                        *w = d;
+                    }
+                }
+            }
+        });
+    }
 
     // --- タスクトレイメニューの構築 ---
     let tray_menu = Menu::new();
@@ -218,7 +269,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(wav_bytes) = samples_to_wav(samples, sample_rate) {
                         let (prompt, local_dict) = {
                             let d = dict_clone.read().unwrap();
-                            let p = d.values().cloned().collect::<Vec<_>>().join(", ");
+                            let p = d
+                                .iter()
+                                .map(|(_, w)| w.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ");
                             (p, d.clone())
                         };
 
@@ -260,21 +315,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if let Ok(event) = menu_channel.try_recv() {
                 if event.id == item_open_config.id() {
-                    // GUI (mameo-config.exe) が core と同じディレクトリにあれば起動、
-                    // 無ければ config.toml を既定エディタで開く（フォールバック）。
-                    let gui_exe = base_dir.join("mameo-config.exe");
-                    if gui_exe.exists() {
-                        let _ = std::process::Command::new(&gui_exe).spawn();
-                    } else {
-                        open_file(&base_dir.join("config.toml"));
-                    }
+                    launch_gui_or_editor(&base_dir, None, &base_dir.join("config.toml"));
                 } else if event.id == item_open_dict.id() {
-                    open_file(&base_dir.join("DICT.csv"));
+                    launch_gui_or_editor(&base_dir, Some("dict"), &base_dir.join("DICT.csv"));
                 } else if event.id == item_reload.id() {
                     let mut c = config.write().unwrap();
                     *c = load_or_create_config(&base_dir);
                     let mut d = dict.write().unwrap();
-                    *d = load_dictionary(&base_dir);
+                    *d = load_dictionary_rows(&base_dir);
                 } else if event.id == item_exit.id() {
                     std::process::exit(0);
                 }

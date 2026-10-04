@@ -4,12 +4,11 @@
 //! Config 構造体の単一真相源（single source of truth）。
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub const GROQ_API_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct AppRule {
     pub process_name: String,
     pub paste_mode: String,
@@ -78,41 +77,15 @@ impl Config {
     }
 }
 
-/// DICT.csv を読み込む（読み方 -> 表記 のハッシュマップ）。
-/// 無ければ親切なテンプレートで自動生成する。
-pub fn load_dictionary(base_dir: &Path) -> HashMap<String, String> {
-    let mut dict = HashMap::new();
-    let path = base_dir.join("DICT.csv");
-
-    if !path.exists() {
-        let template = "スリデブ,Slidev\nクオート,Quarto\nイーマックス,emacs\nエルパカ,Elpaca\n";
-        let _ = std::fs::write(&path, template);
-    }
-
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        for line in content.lines() {
-            let line = line.trim();
-            // 空行や # で始まるコメント行はスキップ
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            // カンマで2つに分割
-            let parts: Vec<&str> = line.splitn(2, ',').map(|s| s.trim()).collect();
-            if parts.len() == 2 && !parts[0].is_empty() {
-                dict.insert(parts[0].to_string(), parts[1].to_string());
-            }
-        }
-    }
-    dict
-}
-
-/// DICT.csv の行リスト（GUI の辞書タブ用）。
-/// (読み方, 表記) のタプル。ファイル順を保持する。
+/// DICT.csv を行順保持のリストで読み込む（読み方 -> 表記）。
+///
+/// 旧 `load_dictionary`（HashMap・順序不定）の後継。プロンプト誘導の語順が
+/// ファイル順に固定され、ハッシュマップの非決定性を排す。
+/// 同じ読みが複数行ある場合は最後の値を採用（HashMap 動作と一致）。
 pub fn load_dictionary_rows(base_dir: &Path) -> Vec<(String, String)> {
-    let mut rows = Vec::new();
-    let path = base_dir.join("DICT.csv");
+    let mut rows: Vec<(String, String)> = Vec::new();
 
+    let path = base_dir.join("DICT.csv");
     if !path.exists() {
         let template = "スリデブ,Slidev\nクオート,Quarto\nイーマックス,emacs\nエルパカ,Elpaca\n";
         let _ = std::fs::write(&path, template);
@@ -126,7 +99,11 @@ pub fn load_dictionary_rows(base_dir: &Path) -> Vec<(String, String)> {
             }
             let parts: Vec<&str> = line.splitn(2, ',').map(|s| s.trim()).collect();
             if parts.len() == 2 && !parts[0].is_empty() {
-                rows.push((parts[0].to_string(), parts[1].to_string()));
+                if let Some(existing) = rows.iter_mut().find(|(r, _)| r == parts[0]) {
+                    existing.1 = parts[1].to_string(); // 後勝ちで値更新・行位置は維持
+                } else {
+                    rows.push((parts[0].to_string(), parts[1].to_string()));
+                }
             }
         }
     }
