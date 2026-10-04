@@ -9,7 +9,7 @@ use rdev::{listen, Event, EventType, Key as RKey};
 use reqwest::blocking::multipart;
 use serde_json::Value;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -110,17 +110,31 @@ fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
 
 /// GUI (mameo-config.exe) を起動する。tab は設定タブ指定。
 /// exe が無い場合はフォールバック (config.toml / DICT.csv を既定エディタで開く)。
+///
+/// GUI は自己 exe (mameo.exe) と同じディレクトリを優先して探す。
+/// base_dir はポータブル config.toml の有無で APPDATA に fallback するため
+/// exe 隣接配置とは乖離する（`~/bin/mameo` に config 無しで置いた場合など）。
 fn launch_gui_or_editor(base_dir: &Path, tab: Option<&str>, fallback: &Path) {
-    let gui_exe = base_dir.join("mameo-config.exe");
-    if gui_exe.exists() {
-        let mut cmd = std::process::Command::new(&gui_exe);
-        if let Some(t) = tab {
-            cmd.arg(t);
+    let mut gui_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            gui_dirs.push(dir.to_path_buf());
         }
-        let _ = cmd.spawn();
-    } else {
-        open_file(fallback);
     }
+    gui_dirs.push(base_dir.to_path_buf());
+
+    for dir in &gui_dirs {
+        let gui_exe = dir.join("mameo-config.exe");
+        if gui_exe.exists() {
+            let mut cmd = std::process::Command::new(&gui_exe);
+            if let Some(t) = tab {
+                cmd.arg(t);
+            }
+            let _ = cmd.spawn();
+            return;
+        }
+    }
+    open_file(fallback);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
