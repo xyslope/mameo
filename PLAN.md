@@ -29,12 +29,14 @@ mameo の機能拡張、設定・辞書管理、タスクトレイ常駐、お�
 - [x] config 配置ルール統一: exe 隣接に config.toml があればポータブル、無ければ `%APPDATA%\mameo` (Roaming)。core と GUI で同一ロジック（MSIX/Store 対応）
 - [x] core 側（トレイメニュー処理）に GUI 検出 conditional を実装（上記起動フロー）
 - [x] GUI 側での `config.toml` 保存処理（lib.rs 経由で `Config` を共有、構造体二重定義解消済み）
-- [ ] GUI 辞書タブ実装（DICT.csv 編集） ※実装済み。残: core の DICT.csv 行順保持へ
-  （core は現在ハッシュマップで列順が変わる可能性 → `load_dictionary_rows` 使用へ統一）
-- [ ] GUI 保存後に core へ設定変更を反映（Reload 不要の即時反映、まずは保存→トレイ側再読み込みで暫定対応でも可）
+- [x] GUI 辞書タブ実装（DICT.csv 編集）＋ core 辞書を行順保持に統一
+  （`load_dictionary` HashMap 版を削除。プロンプト誘導語順が DICT.csv 順に固定）
+- [x] GUI 保存後に core へ設定変更を反映: core 起動時に mtime ポーラ（1.5 秒周期）を常駐、
+  config.toml / DICT.csv の外部変更（GUI 保存・エディタ編集）を Reload 無しで自動反映
 
 ### CLI から GUI を開けるようにする（併設）
-- [ ] GUI アプリ単体起動引数の追加（`mameo-gui.exe --open settings` 等。トレイ以外からも開けるように）
+- [x] GUI アプリ単体起動引数の追加（`mameo-config.exe dict` / `--tab dict` / `--open=dict`。
+  トレイ「辞書を開く」もこの引数付きで GUI を起動、設定タブは従来どおり引数無し）
 
 ## Milestone 5: AI プロバイダ管理（BYOK・マルチプロバイダ対応）
 - [ ] 統一 trait 背後でのプロバイダ抽象化（Groq / OpenAI / Gemini / Ollama）
