@@ -28,7 +28,9 @@ mameo の機能拡張、設定・辞書管理、タスクトレイ常駐、お�
 - [x] mameo-config (別リポジトリ) に Iced GUI 実装: 水色ダークテーマ、トリガーキー / 言語 / API キー / クリップボード復元 / 貼り付けモード / アプリ別ルール編集、config.toml 保存（実機検証済み）
 - [x] config 配置ルール統一: exe 隣接に config.toml があればポータブル、無ければ `%APPDATA%\mameo` (Roaming)。core と GUI で同一ロジック（MSIX/Store 対応）
 - [x] core 側（トレイメニュー処理）に GUI 検出 conditional を実装（上記起動フロー）
-- [ ] GUI 側での `config.toml` 保存処理（既存 `Config` 構造と serde で整合させる） ※実装済み・残: 構造体二重定義の共通化検討
+- [x] GUI 側での `config.toml` 保存処理（lib.rs 経由で `Config` を共有、構造体二重定義解消済み）
+- [ ] GUI 辞書タブ実装（DICT.csv 編集） ※実装済み。残: core の DICT.csv 行順保持へ
+  （core は現在ハッシュマップで列順が変わる可能性 → `load_dictionary_rows` 使用へ統一）
 - [ ] GUI 保存後に core へ設定変更を反映（Reload 不要の即時反映、まずは保存→トレイ側再読み込みで暫定対応でも可）
 
 ### CLI から GUI を開けるようにする（併設）
