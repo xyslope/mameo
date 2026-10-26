@@ -17,6 +17,15 @@ arboard = "3.4"
 enigo = "0.2"
 tray-icon = "0.19"
 muda = "0.15"
+iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "crisp", "thread-pool", "web-colors"] }
+
+[[bin]]
+name = "mameo"
+path = "src/main.rs"
+
+[[bin]]
+name = "mameo-config"
+path = "src/bin/mameo-config.rs"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

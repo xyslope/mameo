@@ -28,9 +28,9 @@ Windows 向けの超軽量・低遅延な Push-to-Talk 型 音声入力ツール
 ```powershell
 git clone https://github.com/xyslope/mameo.git
 cd mameo
-cargo build --release
+cargo build --release --bin mameo --bin mameo-config
 ```
-生成された `target\release\mameo.exe` を使用します。
+生成された `target\release\mameo.exe` と `target\release\mameo-config.exe` を同じフォルダに配置して使用します。設定アプリもこのリポジトリからビルドできます。設定アプリ単独の起動は `cargo run --release --bin mameo-config` です。
 ポータブル版として使う場合は、リポジトリの `portable.flag` を `target\release` にコピーしてください。`cargo build` はフラグを自動コピーしません。
 
 ---
