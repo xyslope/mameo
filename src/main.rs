@@ -3,17 +3,23 @@
 use arboard::Clipboard;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
-use mameo::{get_base_dir, load_dictionary_rows, Config, GROQ_API_URL};
+use mameo::{
+    get_base_dir, is_noise_transcription, load_transcription_prompt, trim_digital_silence, Config,
+};
 use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use rdev::{listen, Event, EventType, Key as RKey};
-use reqwest::blocking::multipart;
-use serde_json::Value;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use tray_icon::{Icon, TrayIconBuilder};
+
+struct LiveRecording {
+    sender: SyncSender<Vec<f32>>,
+    control: mameo::transcription::soniox::StreamControl,
+}
 
 #[cfg(windows)]
 use windows::core::PCWSTR;
@@ -109,11 +115,9 @@ fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
 }
 
 /// GUI (mameo-config.exe) を起動する。tab は設定タブ指定。
-/// exe が無い場合はフォールバック (config.toml / DICT.csv を既定エディタで開く)。
+/// exe が無い場合はフォールバック (config.toml を既定エディタで開く)。
 ///
 /// GUI は自己 exe (mameo.exe) と同じディレクトリを優先して探す。
-/// base_dir はポータブル config.toml の有無で APPDATA に fallback するため
-/// exe 隣接配置とは乖離する（`~/bin/mameo` に config 無しで置いた場合など）。
 fn launch_gui_or_editor(base_dir: &Path, tab: Option<&str>, fallback: &Path) {
     let mut gui_dirs: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
@@ -152,35 +156,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let base_dir = get_base_dir();
+    let base_dir = get_base_dir()?;
     let config = Arc::new(RwLock::new(load_or_create_config(&base_dir)));
-    let dict = Arc::new(RwLock::new(load_dictionary_rows(&base_dir)));
+    // 初回起動時に指示ファイルを用意する。読み取り不可なら既定の本文を使う。
+    let _ = load_transcription_prompt(&base_dir, &config.read().unwrap().llm_prompt_file);
 
-    // --- ファイル監視ポーラ（config.toml / DICT.csv の外部変更を自動反映） ---
+    // --- ファイル監視ポーラ（config.toml の外部変更を自動反映） ---
     // GUI からの保存を Reload 無しで受け取る。mtime 変化検出のみの軽量実装。
     {
         let config_watch = Arc::clone(&config);
-        let dict_watch = Arc::clone(&dict);
         let base = base_dir.clone();
         thread::spawn(move || {
             let mut last_cfg_m = file_mtime(&base.join("config.toml"));
-            let mut last_dict_m = file_mtime(&base.join("DICT.csv"));
             loop {
                 thread::sleep(std::time::Duration::from_millis(1500));
                 let cfg_m = file_mtime(&base.join("config.toml"));
-                let dict_m = file_mtime(&base.join("DICT.csv"));
                 if cfg_m != last_cfg_m {
                     last_cfg_m = cfg_m;
                     let c = Config::load_or_default(&base);
                     if let Ok(mut w) = config_watch.try_write() {
                         *w = c;
-                    }
-                }
-                if dict_m != last_dict_m {
-                    last_dict_m = dict_m;
-                    let d = load_dictionary_rows(&base);
-                    if let Ok(mut w) = dict_watch.try_write() {
-                        *w = d;
                     }
                 }
             }
@@ -190,12 +185,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- タスクトレイメニューの構築 ---
     let tray_menu = Menu::new();
     let item_open_config = MenuItem::new("設定を開く", true, None);
-    let item_open_dict = MenuItem::new("辞書を開く (DICT.csv)", true, None);
-    let item_reload = MenuItem::new("設定・辞書の再読み込み", true, None);
+    let item_open_folder = MenuItem::new("設定フォルダを開く", true, None);
+    let item_reload = MenuItem::new("設定の再読み込み", true, None);
     let item_exit = MenuItem::new("終了 (Exit)", true, None);
 
     let _ = tray_menu.append(&item_open_config);
-    let _ = tray_menu.append(&item_open_dict);
+    let _ = tray_menu.append(&item_open_folder);
     let _ = tray_menu.append(&item_reload);
     let _ = tray_menu.append(&PredefinedMenuItem::separator());
     let _ = tray_menu.append(&item_exit);
@@ -217,14 +212,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let is_recording = Arc::new(AtomicBool::new(false));
     let audio_buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let live_recording: Arc<Mutex<Option<LiveRecording>>> = Arc::new(Mutex::new(None));
 
     let audio_buf_clone = Arc::clone(&audio_buffer);
     let is_rec_clone = Arc::clone(&is_recording);
+    let live_audio = Arc::clone(&live_recording);
 
     let stream = device.build_input_stream(
         &audio_cfg.into(),
         move |data: &[f32], _: &_| {
+            let live = live_audio.lock().unwrap();
             if is_rec_clone.load(Ordering::SeqCst) {
+                if let Some(recording) = live.as_ref() {
+                    let mono = data
+                        .chunks(channels as usize)
+                        .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
+                        .collect();
+                    if let Err(TrySendError::Full(_)) = recording.sender.try_send(mono) {
+                        recording.control.overflowed.store(true, Ordering::Relaxed);
+                    }
+                    return;
+                }
                 let mut buf = audio_buf_clone.lock().unwrap();
                 for chunk in data.chunks(channels as usize) {
                     let mono = chunk.iter().sum::<f32>() / channels as f32;
@@ -241,35 +249,95 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let is_rec_key = Arc::clone(&is_recording);
     let audio_buf_key = Arc::clone(&audio_buffer);
     let config_key = Arc::clone(&config);
-    let dict_key = Arc::clone(&dict);
+    let prompt_base_dir = base_dir.clone();
+    let live_key = Arc::clone(&live_recording);
 
     thread::spawn(move || {
         let _ = listen(move |event: Event| {
-            let (target_key, lang, api_key_cfg) = {
+            let target_key = {
                 let cfg = config_key.read().unwrap();
                 let k = match cfg.trigger_key.to_lowercase().as_str() {
                     "rightcontrol" | "rcontrol" => RKey::ControlRight,
                     "rightshift" | "rshift" => RKey::ShiftRight,
                     _ => RKey::AltGr,
                 };
-                (k, cfg.language.clone(), cfg.groq_api_key.clone())
-            };
-
-            let api_key = if !api_key_cfg.is_empty() {
-                api_key_cfg
-            } else {
-                std::env::var("GROQ_API_KEY").unwrap_or_default()
+                k
             };
 
             if event.event_type == EventType::KeyPress(target_key) {
                 if !is_rec_key.load(Ordering::SeqCst) {
+                    let request_config = config_key.read().unwrap().clone();
+                    let mut live = live_key.lock().unwrap();
                     audio_buf_key.lock().unwrap().clear();
+                    if request_config
+                        .transcription_provider
+                        .trim()
+                        .eq_ignore_ascii_case("soniox")
+                    {
+                        // 上限付きチャネル。音声コールバックでは try_send のみ。
+                        let (sender, receiver) = sync_channel(512);
+                        let control = mameo::transcription::soniox::StreamControl::default();
+                        *live = Some(LiveRecording {
+                            sender,
+                            control: control.clone(),
+                        });
+                        let paste_config = Arc::clone(&config_key);
+                        let base = prompt_base_dir.clone();
+                        thread::spawn(move || {
+                            let prompt =
+                                load_transcription_prompt(&base, &request_config.llm_prompt_file);
+                            match mameo::transcription::soniox::transcribe_stream(
+                                &request_config,
+                                sample_rate,
+                                receiver,
+                                control,
+                                &prompt,
+                            ) {
+                                Ok(result) => {
+                                    eprintln!("Soniox finalization: {}ms", result.finalize_ms);
+                                    let timing = serde_json::json!({
+                                        "connection_ms": result.connection_ms,
+                                        "release_to_finalize_request_ms": result.release_to_finalize_request_ms,
+                                        "finalize_ms": result.finalize_ms,
+                                        "release_to_result_ms": result.release_to_result_ms,
+                                    });
+                                    let diagnostic = if request_config.debug_transcription
+                                        && !result.diagnostic_samples.is_empty()
+                                    {
+                                        samples_to_wav(&result.diagnostic_samples, sample_rate)
+                                            .ok()
+                                            .and_then(|wav| save_diagnostic_audio(&base, &wav))
+                                    } else {
+                                        None
+                                    };
+                                    deliver_transcription(
+                                        result.text,
+                                        &request_config,
+                                        &paste_config,
+                                        diagnostic.as_deref(),
+                                        Some(&timing),
+                                    );
+                                }
+                                Err(error) => eprintln!("Streaming transcription failed: {error}"),
+                            }
+                        });
+                    }
                     is_rec_key.store(true, Ordering::SeqCst);
                 }
             } else if event.event_type == EventType::KeyRelease(target_key)
                 && is_rec_key.load(Ordering::SeqCst)
             {
-                is_rec_key.store(false, Ordering::SeqCst);
+                {
+                    let mut live = live_key.lock().unwrap();
+                    is_rec_key.store(false, Ordering::SeqCst);
+                    // Senderを破棄して確定を通知。次の録音とは別のチャネルを使う。
+                    if let Some(recording) = live.take() {
+                        *recording.control.released_at.lock().unwrap() =
+                            Some(std::time::Instant::now());
+                        drop(recording);
+                        return;
+                    }
+                }
 
                 let samples = audio_buf_key.lock().unwrap().clone();
                 if samples.len() < (sample_rate as usize / 5) {
@@ -277,39 +345,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let config_clone = Arc::clone(&config_key);
-                let dict_clone = Arc::clone(&dict_key);
+                let prompt_base = prompt_base_dir.clone();
 
                 thread::spawn(move || {
+                    let samples = trim_digital_silence(&samples);
+                    if samples.is_empty() {
+                        return; // 完全な無音は API に送らない。
+                    }
                     if let Ok(wav_bytes) = samples_to_wav(samples, sample_rate) {
-                        let (prompt, local_dict) = {
-                            let d = dict_clone.read().unwrap();
-                            let p = d
-                                .iter()
-                                .map(|(_, w)| w.clone())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            (p, d.clone())
+                        let request_config = config_clone.read().unwrap().clone();
+                        let prompt = load_transcription_prompt(
+                            &prompt_base,
+                            &request_config.llm_prompt_file,
+                        );
+                        let diagnostic_path = if request_config.debug_transcription {
+                            save_diagnostic_audio(&prompt_base, &wav_bytes)
+                        } else {
+                            None
                         };
 
-                        if let Ok(mut text) = call_groq_whisper(&api_key, wav_bytes, &lang, &prompt)
+                        match mameo::transcription::transcribe(&request_config, wav_bytes, &prompt)
                         {
-                            let trimmed = text.trim();
-                            if trimmed == "ご視聴ありがとうございました"
-                                || trimmed == "ありがとうございました"
-                                || trimmed == "チャンネル登録お願いします"
-                            {
-                                return;
-                            }
-
-                            for (wrong, correct) in local_dict.iter() {
-                                text = text.replace(wrong, correct);
-                            }
-
-                            let clean_text = text.trim();
-                            if !clean_text.is_empty() {
-                                let cfg = config_clone.read().unwrap();
-                                dispatch_paste(clean_text, &cfg);
-                            }
+                            Ok(text) => deliver_transcription(
+                                text,
+                                &request_config,
+                                &config_clone,
+                                diagnostic_path.as_deref(),
+                                None,
+                            ),
+                            Err(error) => eprintln!("Transcription failed: {error}"),
                         }
                     }
                 });
@@ -330,13 +394,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(event) = menu_channel.try_recv() {
                 if event.id == item_open_config.id() {
                     launch_gui_or_editor(&base_dir, None, &base_dir.join("config.toml"));
-                } else if event.id == item_open_dict.id() {
-                    launch_gui_or_editor(&base_dir, Some("dict"), &base_dir.join("DICT.csv"));
+                } else if event.id == item_open_folder.id() {
+                    open_file(&base_dir);
                 } else if event.id == item_reload.id() {
                     let mut c = config.write().unwrap();
                     *c = load_or_create_config(&base_dir);
-                    let mut d = dict.write().unwrap();
-                    *d = load_dictionary_rows(&base_dir);
                 } else if event.id == item_exit.id() {
                     std::process::exit(0);
                 }
@@ -345,6 +407,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// 明示的に有効化した場合だけ保存。API キーやプロンプトは記録しない。
+fn save_diagnostic_audio(base: &Path, wav: &[u8]) -> Option<PathBuf> {
+    let result = (|| -> std::io::Result<PathBuf> {
+        let dir = base.join("diagnostics");
+        std::fs::create_dir_all(&dir)?;
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        let path = dir.join(format!("{}-{id}.wav", std::process::id()));
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?
+            .write_all(wav)?;
+        Ok(path)
+    })();
+    match result {
+        Ok(path) => Some(path),
+        Err(error) => {
+            eprintln!("Cannot save diagnostic audio: {error}");
+            None
+        }
+    }
+}
+
+fn save_diagnostic_text(
+    path: &Path,
+    raw: &str,
+    config: &Config,
+    discarded: bool,
+    timing: Option<&serde_json::Value>,
+) {
+    let data = serde_json::json!({
+        "raw_text": raw,
+        "language": config.language,
+        "provider": config.transcription_provider,
+        "model": match config.transcription_provider.trim().to_ascii_lowercase().as_str() {
+            "gemini" => &config.gemini_model,
+            "soniox" => &config.soniox_model,
+            _ => &config.groq_model,
+        },
+        "discarded": discarded,
+        "timing": timing,
+    });
+    let result = serde_json::to_vec_pretty(&data)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(path.with_extension("json"), bytes));
+    if let Err(error) = result {
+        eprintln!("Cannot save diagnostic text: {error}");
+    }
+}
+
+fn deliver_transcription(
+    text: String,
+    request_config: &Config,
+    paste_config: &RwLock<Config>,
+    diagnostic: Option<&Path>,
+    timing: Option<&serde_json::Value>,
+) {
+    if is_noise_transcription(&text) {
+        if let Some(path) = diagnostic {
+            save_diagnostic_text(path, &text, request_config, true, timing);
+        }
+        return;
+    }
+    if let Some(path) = diagnostic {
+        save_diagnostic_text(path, &text, request_config, false, timing);
+    }
+    if !text.trim().is_empty() {
+        let config = paste_config.read().unwrap().clone();
+        dispatch_paste(text.trim(), &config);
+    }
 }
 
 fn dispatch_paste(text: &str, config: &Config) {
@@ -395,7 +533,7 @@ fn dispatch_paste(text: &str, config: &Config) {
 }
 
 fn samples_to_wav(
-    samples: Vec<f32>,
+    samples: &[f32],
     sample_rate: u32,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut cursor = Cursor::new(Vec::new());
@@ -412,38 +550,4 @@ fn samples_to_wav(
     }
     writer.finalize()?;
     Ok(cursor.into_inner())
-}
-
-fn call_groq_whisper(
-    api_key: &str,
-    wav_data: Vec<u8>,
-    lang: &str,
-    prompt: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let client = reqwest::blocking::Client::new();
-    let part = multipart::Part::bytes(wav_data)
-        .file_name("audio.wav")
-        .mime_str("audio/wav")?;
-
-    let mut form = multipart::Form::new()
-        .part("file", part)
-        .text("model", "whisper-large-v3-turbo")
-        .text("response_format", "json");
-
-    if !lang.is_empty() && lang != "auto" {
-        form = form.text("language", lang.to_string());
-    }
-    if !prompt.is_empty() {
-        form = form.text("prompt", prompt.to_string());
-    }
-
-    let res = client
-        .post(GROQ_API_URL)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .multipart(form)
-        .send()?
-        .json::<Value>()?;
-
-    let text = res["text"].as_str().unwrap_or("").to_string();
-    Ok(text)
 }
