@@ -187,11 +187,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let item_open_config = MenuItem::new("設定を開く", true, None);
     let item_open_folder = MenuItem::new("設定フォルダを開く", true, None);
     let item_reload = MenuItem::new("設定の再読み込み", true, None);
+    let item_microphone = MenuItem::new("マイク: 確認中…", false, None);
     let item_exit = MenuItem::new("終了 (Exit)", true, None);
 
     let _ = tray_menu.append(&item_open_config);
     let _ = tray_menu.append(&item_open_folder);
     let _ = tray_menu.append(&item_reload);
+    let _ = tray_menu.append(&item_microphone);
     let _ = tray_menu.append(&PredefinedMenuItem::separator());
     let _ = tray_menu.append(&item_exit);
 
@@ -204,6 +206,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- 音声入力ストリーム初期化 ---
     let host = cpal::default_host();
     let device = host.default_input_device().expect("No input device found");
+    let device_name = device.name().unwrap_or_else(|_| "名称不明".to_string());
+    item_microphone.set_text(format!("マイク: {device_name}"));
     let audio_cfg = device
         .default_input_config()
         .expect("Failed to get audio config");
@@ -217,6 +221,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audio_buf_clone = Arc::clone(&audio_buffer);
     let is_rec_clone = Arc::clone(&is_recording);
     let live_audio = Arc::clone(&live_recording);
+    let stream_failed = Arc::new(AtomicBool::new(false));
+    let stream_failed_cb = Arc::clone(&stream_failed);
 
     let stream = device.build_input_stream(
         &audio_cfg.into(),
@@ -240,10 +246,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
-        |err| eprintln!("Audio stream error: {err}"),
+        move |err| {
+            eprintln!("Audio stream error: {err}");
+            stream_failed_cb.store(true, Ordering::SeqCst);
+        },
         None,
     )?;
     stream.play()?;
+    let mut stream = Some(stream);
 
     // --- キーボード監視スレッド ---
     let is_rec_key = Arc::clone(&is_recording);
@@ -391,6 +401,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
 
+            // WASAPI ストリームはスリープ復帰後に無効化されることがある。
+            // エラーを検出したら既定入力デバイスからストリームを作り直す。
+            if stream_failed.swap(false, Ordering::SeqCst) {
+                stream.take();
+                thread::sleep(std::time::Duration::from_millis(500));
+                match host.default_input_device() {
+                    Some(device) => match device.default_input_config() {
+                        Ok(cfg) => {
+                            let name = device.name().unwrap_or_else(|_| "名称不明".to_string());
+                            match device.build_input_stream(
+                                &cfg.into(),
+                                {
+                                    let audio_buf = Arc::clone(&audio_buffer);
+                                    let recording = Arc::clone(&is_recording);
+                                    let live = Arc::clone(&live_recording);
+                                    let channels = channels as usize;
+                                    move |data: &[f32], _: &_| {
+                                        if !recording.load(Ordering::SeqCst) {
+                                            return;
+                                        }
+                                        let live = live.lock().unwrap();
+                                        if let Some(r) = live.as_ref() {
+                                            let mono = data
+                                                .chunks(channels)
+                                                .map(|c| c.iter().sum::<f32>() / channels as f32)
+                                                .collect();
+                                            if let Err(TrySendError::Full(_)) =
+                                                r.sender.try_send(mono)
+                                            {
+                                                r.control.overflowed.store(true, Ordering::Relaxed);
+                                            }
+                                        } else {
+                                            let mut buf = audio_buf.lock().unwrap();
+                                            for c in data.chunks(channels) {
+                                                buf.push(c.iter().sum::<f32>() / channels as f32);
+                                            }
+                                        }
+                                    }
+                                },
+                                {
+                                    let failed = Arc::clone(&stream_failed);
+                                    move |err| {
+                                        eprintln!("Audio stream error: {err}");
+                                        failed.store(true, Ordering::SeqCst);
+                                    }
+                                },
+                                None,
+                            ) {
+                                Ok(new_stream) => match new_stream.play() {
+                                    Ok(()) => {
+                                        stream = Some(new_stream);
+                                        item_microphone.set_text(format!("マイク: {name}"));
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Could not restart audio stream: {e}");
+                                        stream_failed.store(true, Ordering::SeqCst);
+                                    }
+                                },
+                                Err(e) => {
+                                    eprintln!("Could not rebuild audio stream: {e}");
+                                    stream_failed.store(true, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Could not get audio config after resume: {e}");
+                            stream_failed.store(true, Ordering::SeqCst);
+                        }
+                    },
+                    None => {
+                        eprintln!("No input device after resume");
+                        stream_failed.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
             if let Ok(event) = menu_channel.try_recv() {
                 if event.id == item_open_config.id() {
                     launch_gui_or_editor(&base_dir, None, &base_dir.join("config.toml"));

@@ -25,26 +25,54 @@ Windows 向けの超軽量・低遅延な Push-to-Talk 型 音声入力ツール
 3. ZIP 配布には `portable.flag` を同梱し、`mameo.exe` と同じフォルダに配置してください。
 
 ### 方法 B: ソースからビルドする
+
+開発環境でのビルド・配置・再起動は、実行中の `mameo.exe` を終了してから行います。PowerShell でリポジトリのルートに移動し、次を実行してください。
+
 ```powershell
-git clone https://github.com/xyslope/mameo.git
-cd mameo
+Get-Process mameo -ErrorAction SilentlyContinue | Stop-Process -Force
 cargo build --release --bin mameo --bin mameo-config
+New-Item -ItemType Directory -Force "$HOME/bin/mameo" | Out-Null
+Copy-Item target/release/mameo.exe "$HOME/bin/mameo/mameo.exe" -Force
+Copy-Item target/release/mameo-config.exe "$HOME/bin/mameo/mameo-config.exe" -Force
+Start-Process "$HOME/bin/mameo/mameo.exe"
 ```
-生成された `target\release\mameo.exe` と `target\release\mameo-config.exe` を同じフォルダに配置して使用します。設定アプリもこのリポジトリからビルドできます。設定アプリ単独の起動は `cargo run --release --bin mameo-config` です。
-ポータブル版として使う場合は、リポジトリの `portable.flag` を `target\release` にコピーしてください。`cargo build` はフラグを自動コピーしません。
+
+この手順で `mameo.exe` を停止し、ビルドした実行ファイルを `~/bin/mameo`（通常は `C:\Users\<ユーザー名>\bin\mameo`）へ配置して、Mameo を起動します。設定アプリ単独の起動は `cargo run --release --bin mameo-config` です。
+ポータブル版として使う場合は、`portable.flag` を実行ファイルと同じフォルダに配置してください。`cargo build` はフラグを自動コピーしません。
 
 ---
 
 ## 初期設定
 
-### 1. Groq API キーの準備
-[Groq Console](https://console.groq.com/) で無料の API キーを発行します。
+### 1. API キーを取得する
 
-以下のいずれかの方法で設定します。
-- **方法 1（推奨）**: 初回起動時に自動生成される `config.toml` を開き、`groq_api_key = "gsk_xxxx..."` に記述する。
-- **方法 2**: Windows の環境変数 `GROQ_API_KEY` にキーを登録しておく。
+使用する文字起こしサービスの公式サイトでアカウントを作成し、API キーを発行します。料金・無料枠・利用条件は各サービスの最新案内を確認してください。
 
-### 2. 起動
+| サービス | API キー取得先 | Windows 環境変数名 |
+|---|---|---|
+| Groq | [Groq Console - API Keys](https://console.groq.com/keys) | `GROQ_API_KEY` |
+| Gemini | [Google AI Studio - API keys](https://aistudio.google.com/app/apikey) | `GEMINI_API_KEY` |
+| Soniox | [Soniox Console](https://console.soniox.com/) の API Keys | `SONIOX_API_KEY` |
+
+API キーは設定画面や `config.toml` には入力しません。Windows のユーザー環境変数として登録します。PowerShell で、使うサービスのコマンドを実行し、`ここに取得したAPIキー` を実際のキーに置き換えてください。
+
+```powershell
+[Environment]::SetEnvironmentVariable("GROQ_API_KEY", "ここに取得したAPIキー", "User")
+[Environment]::SetEnvironmentVariable("GEMINI_API_KEY", "ここに取得したAPIキー", "User")
+[Environment]::SetEnvironmentVariable("SONIOX_API_KEY", "ここに取得したAPIキー", "User")
+```
+
+利用しないプロバイダーのコマンドは実行不要です。設定後は、環境変数を読み込ませるため **Mameo と設定アプリを終了してから起動し直してください**。API キーは秘密情報として扱い、他人と共有したり、リポジトリやログへ貼り付けたりしないでください。
+
+### 2. プロバイダー・モデルを設定してテストする
+
+`mameo-config` の「設定」タブで、使用するプロバイダー（Groq / Gemini / Soniox）を選び、モデル名を入力します。初期値は `config.toml` の `groq_model` / `gemini_model` / `soniox_model` に保存されている値です。モデル名は各サービスで利用可能なものを指定してください。
+
+「接続テスト」を押すと、リポジトリに含まれる固定音声 `test-data/transcriptiontest.wav` を選択中のサービスへ送信します。実際のマイク音声は送信しません。結果は「未検証」「テスト中…」「成功」「失敗」で表示されます。API キーが未設定・無効、モデル名の誤り、権限・通信エラーなどは失敗となります。テストは実際の API リクエストなので、各サービスの料金・利用枠が適用される場合があります。
+
+テストの文字起こし結果またはエラーは、設定フォルダの `diagnostics/api-test-<プロバイダー>-<時刻>.log` に保存され、設定画面に保存先が表示されます。ログには API キーを保存しません。失敗時はログを確認してください。
+
+### 3. 起動
 `mameo.exe` を実行します。コンソール画面は開かず、タスクバーの通知領域（タスクトレイ）に赤い丸アイコンが表示されます。
 
 ---
@@ -75,11 +103,10 @@ Store版には `portable.flag` を同梱しません。exe の隣に `config.tom
 trigger_key = "RightAlt"        # 録音キー: "RightAlt", "RightControl", "RightShift"
 language = "ja"                 # 言語: "ja", "en", "auto"
 llm_prompt_file = "llm-jp-normal.md" # API に渡す指示ファイル（空欄で指示を無効化）
-groq_api_key = ""               # 空欄の場合は環境変数 GROQ_API_KEY を参照
 transcription_provider = "groq" # "groq", "gemini", "soniox"
-groq_model = "whisper-large-v3-turbo"
-gemini_model = "gemini-3.8-flash" # 環境変数 GEMINI_API_KEY を使用
-soniox_model = "stt-rt-v5"       # 環境変数 SONIOX_API_KEY を使用
+groq_model = "whisper-large-v3-turbo" # 環境変数 GROQ_API_KEY を使用
+gemini_model = "gemini-3.8-flash"    # 環境変数 GEMINI_API_KEY を使用
+soniox_model = "stt-rt-v5"           # 環境変数 SONIOX_API_KEY を使用
 restore_clipboard = true        # ペースト後にクリップボード履歴を復元するか
 debug_transcription = false    # true で録音・認識結果を保存（原因調査用）
 default_paste_mode = "auto"     # "auto" (Ctrl+V) または "copy_only"

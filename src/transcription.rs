@@ -47,11 +47,7 @@ fn response_json(response: Response) -> Result<Value, String> {
 }
 
 fn groq(client: &Client, config: &Config, wav: Vec<u8>, prompt: &str) -> Result<String, String> {
-    let key = if config.groq_api_key.trim().is_empty() {
-        env_key("GROQ_API_KEY")?
-    } else {
-        config.groq_api_key.clone()
-    };
+    let key = env_key("GROQ_API_KEY")?;
     if config.groq_model.trim().is_empty() {
         return Err("groq_model is empty".into());
     }

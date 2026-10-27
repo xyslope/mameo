@@ -99,7 +99,12 @@ struct State {
     // --- 設定タブ: 編集中の値（確定時に config.toml へ書き出す） ---
     trigger_key: TriggerKey,
     language: Language,
-    api_key: String,
+    transcription_provider: TranscriptionProvider,
+    groq_model: String,
+    gemini_model: String,
+    soniox_model: String,
+    test_status: String,
+    test_log_path: Option<std::path::PathBuf>,
     restore_clipboard: bool,
     default_paste_mode: PasteMode,
     app_rules: Vec<RuleRow>,
@@ -184,6 +189,44 @@ impl Language {
 impl std::fmt::Display for Language {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// pick_list 用文字起こしプロバイダー
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptionProvider {
+    Groq,
+    Gemini,
+    Soniox,
+}
+
+impl TranscriptionProvider {
+    const ALL: [Self; 3] = [Self::Groq, Self::Gemini, Self::Soniox];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Groq => "groq",
+            Self::Gemini => "gemini",
+            Self::Soniox => "soniox",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "gemini" => Self::Gemini,
+            "soniox" => Self::Soniox,
+            _ => Self::Groq,
+        }
+    }
+}
+
+impl std::fmt::Display for TranscriptionProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Groq => "Groq",
+            Self::Gemini => "Gemini",
+            Self::Soniox => "Soniox",
+        })
     }
 }
 
@@ -277,7 +320,12 @@ impl State {
             active_tab: start_tab.unwrap_or(Tab::Settings),
             trigger_key: TriggerKey::parse(&cfg.trigger_key),
             language: Language::parse(&cfg.language),
-            api_key: cfg.groq_api_key,
+            transcription_provider: TranscriptionProvider::parse(&cfg.transcription_provider),
+            groq_model: cfg.groq_model,
+            gemini_model: cfg.gemini_model,
+            soniox_model: cfg.soniox_model,
+            test_status: "未検証".into(),
+            test_log_path: None,
             restore_clipboard: cfg.restore_clipboard,
             default_paste_mode: PasteMode::parse(&cfg.default_paste_mode),
             app_rules: cfg
@@ -294,7 +342,12 @@ impl State {
         Config {
             trigger_key: self.trigger_key.as_str().to_string(),
             language: self.language.as_str().to_string(),
-            groq_api_key: self.api_key.clone(),
+            transcription_provider: self.transcription_provider.as_str().to_string(),
+            groq_model: self.groq_model.clone(),
+            gemini_model: self.gemini_model.clone(),
+            soniox_model: self.soniox_model.clone(),
+            // API キーは環境変数から取得し、設定ファイルへ保存しない。
+            groq_api_key: String::new(),
             restore_clipboard: self.restore_clipboard,
             default_paste_mode: self.default_paste_mode.as_str().to_string(),
             app_rules: self
@@ -306,6 +359,22 @@ impl State {
                 })
                 .collect(),
             ..Config::load_or_default(&self.base_dir)
+        }
+    }
+
+    fn current_model_mut(&mut self) -> &mut String {
+        match self.transcription_provider {
+            TranscriptionProvider::Groq => &mut self.groq_model,
+            TranscriptionProvider::Gemini => &mut self.gemini_model,
+            TranscriptionProvider::Soniox => &mut self.soniox_model,
+        }
+    }
+
+    fn current_model(&self) -> &str {
+        match self.transcription_provider {
+            TranscriptionProvider::Groq => &self.groq_model,
+            TranscriptionProvider::Gemini => &self.gemini_model,
+            TranscriptionProvider::Soniox => &self.soniox_model,
         }
     }
 
@@ -333,7 +402,10 @@ enum Message {
 
     TriggerKeySelected(TriggerKey),
     LanguageSelected(Language),
-    ApiKeyChanged(String),
+    TranscriptionProviderSelected(TranscriptionProvider),
+    ModelChanged(String),
+    TestConnection,
+    TestFinished(Result<(String, std::path::PathBuf), String>),
     RestoreClipboardToggled(bool),
     PasteModeSelected(PasteMode),
 
@@ -365,10 +437,65 @@ impl State {
                 self.language = l;
                 self.dirty = true;
             }
-            Message::ApiKeyChanged(s) => {
-                self.api_key = s;
+            Message::TranscriptionProviderSelected(provider) => {
+                self.transcription_provider = provider;
+                self.test_status = "未検証".into();
                 self.dirty = true;
             }
+            Message::ModelChanged(model) => {
+                self.current_model_mut().clone_from(&model);
+                self.test_status = "未検証".into();
+                self.dirty = true;
+            }
+            Message::TestConnection => {
+                let mut config = self.to_config();
+                config.llm_prompt_file.clear();
+                let base = self.base_dir.clone();
+                self.test_status = "テスト中…".into();
+                return Task::perform(
+                    async move {
+                        let model = match config.transcription_provider.as_str() {
+                            "groq" => &config.groq_model,
+                            "gemini" => &config.gemini_model,
+                            _ => &config.soniox_model,
+                        }
+                        .clone();
+                        let wav = include_bytes!("../../test-data/transcriptiontest.wav").to_vec();
+                        let result = mameo::transcription::transcribe(&config, wav, "");
+                        let success = result.is_ok();
+                        let log = format!(
+                            "provider={}\nmodel={}\nresult={:?}\n",
+                            config.transcription_provider, model, result
+                        );
+                        let dir = base.join("diagnostics");
+                        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                        let stamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let path = dir.join(format!(
+                            "api-test-{}-{stamp}.log",
+                            config.transcription_provider
+                        ));
+                        std::fs::write(&path, log).map_err(|e| e.to_string())?;
+                        if success {
+                            Ok(("成功".into(), path))
+                        } else {
+                            Ok(("失敗".into(), path))
+                        }
+                    },
+                    Message::TestFinished,
+                );
+            }
+            Message::TestFinished(result) => match result {
+                Ok((status, path)) => {
+                    self.test_status = status;
+                    self.test_log_path = Some(path);
+                }
+                Err(error) => {
+                    self.test_status = format!("失敗: {error}");
+                }
+            },
             Message::RestoreClipboardToggled(v) => {
                 self.restore_clipboard = v;
                 self.dirty = true;
@@ -557,13 +684,35 @@ impl State {
             .width(180),
         );
 
-        let api_key_row = labeled_row(
-            "Groq API キー",
-            text_input("gsk_...", &self.api_key)
-                .on_input(Message::ApiKeyChanged)
-                .secure(true)
-                .width(320),
+        let provider_row = labeled_row(
+            "文字起こしモデル",
+            pick_list(
+                TranscriptionProvider::ALL,
+                Some(self.transcription_provider),
+                Message::TranscriptionProviderSelected,
+            )
+            .width(180),
         );
+        let model_row = labeled_row(
+            "モデル名",
+            text_input("モデル名", self.current_model())
+                .on_input(Message::ModelChanged)
+                .width(240),
+        );
+        let test_row = row![
+            button("接続テスト").on_press(Message::TestConnection),
+            text(if let Some(path) = &self.test_log_path {
+                format!("{} — {}", self.test_status, path.display())
+            } else {
+                self.test_status.clone()
+            })
+            .size(12),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+        let provider_note = text(
+            "API キーは GROQ_API_KEY / GEMINI_API_KEY / SONIOX_API_KEY 環境変数で設定します。接続テストでは test-data/transcriptiontest.wav を送信します。",
+        ).size(11);
 
         let clipboard_row = row![checkbox(self.restore_clipboard)
             .label("音声入力後にクリップボードの内容を復元する")
@@ -622,7 +771,10 @@ impl State {
         column![
             trigger_row,
             language_row,
-            api_key_row,
+            provider_row,
+            model_row,
+            test_row,
+            provider_note,
             clipboard_row,
             paste_mode_row,
             rules_box,
