@@ -22,7 +22,10 @@ Windows 向けの超軽量・低遅延な Push-to-Talk 型 音声入力ツール
 ### 方法 A: リリースバイナリを利用する（推奨）
 1. Releases から最新の `mameo-vX.X.X-windows-x64.zip` をダウンロードして解凍します。
 2. 任意のフォルダ（例: `C:\Tools\mameo`）に配置します。
-3. ZIP 配布には `portable.flag` を同梱し、`mameo.exe` と同じフォルダに配置してください。
+3. ZIP には `portable.flag` が含まれており、設定は exe と同じフォルダに保存されます。
+
+#### リリース ZIP の作成
+`v*` 形式のタグ（例: `v0.1.0`）を GitHub に push すると、GitHub Actions が Windows x64 用のリリースビルドを行い、`mameo-v0.1.0-windows-x64.zip` のような ZIP を GitHub Release に添付します。ZIP には `mameo.exe`、`mameo-config.exe`、`portable.flag`、README、ライセンス、標準プロンプトを含みます。
 
 ### 方法 B: ソースからビルドする
 
